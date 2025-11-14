@@ -1,0 +1,58 @@
+gitignore
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Environment variables and config files (if any)
+.env
+.env.local
+.env.development
+.env.production
+
+# Python distributions and packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+envs/
+ENV/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Local configuration files (if any custom config is added later)
+config.local.py
+local_settings.py
+
+# Optional: if you use Jupyter notebooks
+*.ipynb
+ipynb_checkpoints/
+
+# Optional: if you generate any cache or temp files
+.cache/
+tmp/
+temp/

@@ -1,0 +1,15 @@
+# 数据处理库
+polars>=0.18.0
+pandas>=1.5.0
+
+# API接口库
+tushare>=1.2.0
+
+# 系统工具库
+psutil>=5.9.0
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# 类型提示
+typing-extensions>=4.0.0
