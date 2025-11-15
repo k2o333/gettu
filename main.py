@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 import logging
+import re
 from config import APP_DIR, DATA_INTERFACE_CONFIG
 from metadata import init_metadata_db, get_last_update_date
 from dictionaries import create_dictionaries
@@ -92,19 +93,36 @@ def run_daily_update():
 def run_initial_build(data_types=None, start_date='20050101', end_date=None):
     """运行初始数据构建，使用指定的起始和结束日期"""
     logging.info(f"开始初始数据构建 (日期范围: {start_date} - {end_date or 'today'})...")
-    
+
     try:
         if end_date is None:
             end_date = datetime.now().strftime('%Y%m%d')
-        
+
         # 使用自定义的初始构建函数，而不是SchedulerRuntime默认的
         # 这里我们会为每个数据类型使用指定的时间范围
         from custom_build import build_with_date_range
         build_with_date_range(data_types, start_date, end_date)
-        
+
         logging.info("初始数据构建完成")
     except Exception as e:
         logging.error(f"初始数据构建失败: {str(e)}")
+        raise
+
+
+def run_initial_build_enhanced(data_types=None, start_date='20050101', end_date=None):
+    """运行初始数据构建，使用增强扫描和智能决策（推荐）"""
+    logging.info(f"开始增强版初始数据构建 (日期范围: {start_date} - {end_date or 'today'})...")
+
+    try:
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y%m%d')
+
+        from custom_build import build_with_enhanced_scan
+        build_with_enhanced_scan(data_types, start_date, end_date)
+
+        logging.info("增强版初始数据构建完成")
+    except Exception as e:
+        logging.error(f"增强版初始数据构建失败: {str(e)}")
         raise
 
 
@@ -144,8 +162,13 @@ def main():
             end_date = None  # 默认到今天
 
             if len(sys.argv) > 2:
-                # 检查是否指定了数据类型
-                if sys.argv[2] not in ['20050101', '20050104']:  # 检查是否是日期格式
+                # 检查是否指定了数据类型，支持多种日期格式
+                date_format_check = sys.argv[2]
+                # 检查是否是日期格式（包含连字符或数字）
+                is_date_format = (re.match(r'^\d{4}-\d{2}-\d{2}$', date_format_check) is not None or
+                                  re.match(r'^\d{8}$', date_format_check) is not None)
+
+                if not is_date_format:
                     data_types = sys.argv[2].split(',')
 
                     # 如果指定了日期范围
@@ -155,22 +178,52 @@ def main():
                             end_date = sys.argv[4]
                 else:
                     data_types = None
-                    start_date = sys.argv[2]
+                    start_date = date_format_check.replace('-', '')  # 转换 2005-01-01 为 20050101
                     if len(sys.argv) > 3:
-                        end_date = sys.argv[3]
+                        end_date = sys.argv[3].replace('-', '') if '-' in sys.argv[3] else sys.argv[3]
             else:
                 data_types = None
 
             run_initial_build(data_types, start_date, end_date)
+        elif mode == 'initial_build_enhanced':
+            start_date = '20050101'  # 默认从2005年1月1日开始
+            end_date = None  # 默认到今天
+
+            if len(sys.argv) > 2:
+                # 检查是否指定了数据类型，支持多种日期格式
+                date_format_check = sys.argv[2]
+                # 检查是否是日期格式（包含连字符或数字）
+                is_date_format = (re.match(r'^\d{4}-\d{2}-\d{2}$', date_format_check) is not None or
+                                  re.match(r'^\d{8}$', date_format_check) is not None)
+
+                if not is_date_format:
+                    data_types = sys.argv[2].split(',')
+
+                    # 如果指定了日期范围
+                    if len(sys.argv) > 3:
+                        start_date = sys.argv[3]
+                        if len(sys.argv) > 4:
+                            end_date = sys.argv[4]
+                else:
+                    data_types = None
+                    start_date = date_format_check.replace('-', '')  # 转换 2005-01-01 为 20050101
+                    if len(sys.argv) > 3:
+                        end_date = sys.argv[3].replace('-', '') if '-' in sys.argv[3] else sys.argv[3]
+            else:
+                data_types = None
+
+            run_initial_build_enhanced(data_types, start_date, end_date)
         elif mode == '--test':
             # 使用多线程运行并发测试
             run_test_concurrent()
         else:
             print(f"未知模式: {mode}")
-            print("可用模式: daily_update, initial_build, --test")
+            print("可用模式: daily_update, initial_build, initial_build_enhanced, --test")
             print("示例: python main.py --test")
             print("      python main.py initial_build")
+            print("      python main.py initial_build_enhanced")
             print("      python main.py initial_build daily,moneyflow 20050101 20231231")
+            print("      python main.py initial_build_enhanced daily,moneyflow 20050101 20231231")
     else:
         # 默认运行每日更新
         run_daily_update_concurrent()

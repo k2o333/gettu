@@ -12,17 +12,17 @@ def atomic_partitioned_sink(lazy_frame, base_path: Path, partition_by: list):
     将数据按分区写入，避免数据损坏
     """
     try:
-        # 确保基础路径存在
-        base_path.mkdir(parents=True, exist_ok=True)
-
         # 收集数据
         df = lazy_frame.collect()
 
-        # 检查分区字段是否存在
+        # 检查分区字段是否存在 - 如果缺失立即中断
         missing_cols = [col for col in partition_by if col not in df.columns]
         if missing_cols:
-            logging.warning(f"分区字段不存在: {missing_cols}")
-            return
+            logging.error(f"分区字段缺失: {missing_cols}，立即中断执行。不允许降级到非分区存储。")
+            raise ValueError(f"分区字段缺失: {missing_cols}，无法执行分区存储操作")
+
+        # 确保基础路径存在
+        base_path.mkdir(parents=True, exist_ok=True)
 
         # 按分区字段分组
         for partition_values in df.select(partition_by).unique().iter_rows():
@@ -77,7 +77,7 @@ def atomic_partitioned_sink(lazy_frame, base_path: Path, partition_by: list):
                     if 'backup_path' in locals() and backup_path.exists():
                         backup_path.unlink()
 
-                    logging.info(f"成功写入分区 {partition_dir.name}: {len(partition_df)} 条记录")
+                    logging.debug(f"成功写入分区 {partition_dir.name}: {len(partition_df)} 条记录")
                 except Exception as e:
                     # 如果出错，删除临时文件
                     if Path(tmp_file.name).exists():

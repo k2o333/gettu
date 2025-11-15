@@ -1,10 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import threading
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
+from queue import Queue
 from config import DATA_INTERFACE_CONFIG
 from interface_manager import download_data_by_config
 from etl_runtime import EtlRuntime
@@ -45,6 +46,66 @@ class RateLimitManager:
             oldest_time = times[0]
             elapsed = (datetime.now() - oldest_time).seconds
             return max(0, time_window - elapsed)
+
+
+class InterfaceTaskManager:
+    """接口任务管理器：确保每个接口最多一个线程在处理，但总体不超过指定数量的线程"""
+    def __init__(self, max_workers=10):
+        # 全局线程池，限制最大并发数
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        # 每个接口的任务队列
+        self.interface_queues = {}
+        # 每个接口的处理锁，确保每个接口一次只被一个线程处理
+        self.interface_locks = {}
+        # 每个接口的处理状态，确保每个接口一次只被一个线程处理
+        self.interface_status = {}
+        # 全局锁，保护共享资源
+        self.global_lock = threading.Lock()
+
+    def submit_interface_task(self, interface_name: str, task_func: Callable, *args, **kwargs):
+        """为指定接口提交任务"""
+        with self.global_lock:
+            # 为每个接口创建独立的队列和锁
+            if interface_name not in self.interface_queues:
+                self.interface_queues[interface_name] = Queue()
+                self.interface_locks[interface_name] = threading.Lock()
+                self.interface_status[interface_name] = {'active': False}
+
+        # 将任务加入接口队列
+        task = (task_func, args, kwargs)
+        self.interface_queues[interface_name].put(task)
+
+        # 提交一个调度任务到线程池，由它来处理接口队列中的任务
+        future = self.executor.submit(self._process_interface_queue, interface_name)
+        return future
+
+    def _process_interface_queue(self, interface_name: str):
+        """处理指定接口的任务队列"""
+        lock = self.interface_locks[interface_name]
+
+        # 尝试获取接口锁，如果正在处理，则跳过
+        if not lock.acquire(blocking=False):
+            # 如果接口正在被处理，直接返回
+            return
+
+        try:
+            self.interface_status[interface_name]['active'] = True
+            queue = self.interface_queues[interface_name]
+
+            # 处理队列中的一个任务
+            if not queue.empty():
+                task_func, args, kwargs = queue.get()
+
+                try:
+                    # 执行实际任务
+                    result = task_func(*args, **kwargs)
+                    return result
+                except Exception as e:
+                    logging.error(f"处理接口 {interface_name} 任务时出错: {str(e)}")
+                    raise
+        finally:
+            self.interface_status[interface_name]['active'] = False
+            lock.release()
 
 
 class DailyLimitManager:
@@ -88,7 +149,7 @@ class OptimizedDataDownloader:
     def __init__(self, max_workers=10):
         self.rate_limiter = RateLimitManager()
         self.daily_limiter = DailyLimitManager()
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.task_manager = InterfaceTaskManager(max_workers=max_workers)
         self.max_workers = max_workers
 
     def download_with_retry(self, data_type: str, params: Dict[str, Any], max_retries: int = 3) -> Any:
@@ -385,12 +446,62 @@ class OptimizedDataDownloader:
 
         return kwargs
 
+    def _download_single_data_type_with_rate_limit(self, data_type: str):
+        """带速率限制的单个接口下载 - 内部函数"""
+        config = DATA_INTERFACE_CONFIG[data_type]
+        supports = config['supports']
+
+        # 检查是否有每日限制
+        daily_limit = config.get('daily_limit', None)
+
+        if daily_limit is not None:
+            # 检查是否还有当日请求次数
+            if not self.daily_limiter.can_make_request_today(data_type, daily_limit):
+                logging.info(f"测试: {data_type} 已达到每日请求限制，跳过测试")
+                return None
+            else:
+                # 对于有每日限制的接口，使用特殊处理
+                result = self._download_single_data_type_with_pagination(data_type)
+                return result
+        else:
+            # 普通接口按正常流程下载
+            kwargs = self.build_test_parameters(data_type, supports)
+
+            # 检查速率限制
+            api_limit = config.get('api_limit', 500)
+            api_name = config.get('api_name', data_type)
+
+            while not self.rate_limiter.can_make_request(api_name, api_limit // 10):
+                wait_time = self.rate_limiter.get_wait_time(api_name, api_limit // 10)
+                logging.info(f"等待 {wait_time} 秒以避免 {api_name} 接口速率限制")
+                time.sleep(wait_time)
+
+            # 下载数据
+            for attempt in range(3):  # 最多重试3次
+                try:
+                    df = self.download_with_retry(data_type, kwargs)
+                    return df
+                except Exception as e:
+                    error_msg = str(e)
+                    if "权限" in error_msg or "速率" in error_msg or "限制" in error_msg:
+                        wait_time = 60 * (attempt + 1)
+                        logging.warning(f"{data_type} 遇到速率限制，等待 {wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logging.error(f"下载 {data_type} 时出错: {error_msg}")
+                        break
+
+        return None
+
     def process_and_store_data(self, data_type: str, df):
         """处理和存储数据"""
         if df is not None and len(df) > 0:
             try:
                 # 在独立线程中运行ETL处理
-                self.executor.submit(self._run_etl_process, data_type, df)
+                # Note: For ETL processing, we may still want to use a separate thread
+                # but we need to ensure we don't cause conflicts with interface processing
+                self.task_manager.executor.submit(self._run_etl_process, data_type, df)
                 logging.info(f"{data_type} 数据已提交存储处理")
             except Exception as e:
                 logging.error(f"提交处理 {data_type} 数据时出错: {str(e)}")
@@ -404,26 +515,17 @@ class OptimizedDataDownloader:
             logging.error(f"ETL处理 {data_type} 时出错: {str(e)}")
 
     def download_all_data_test(self):
-        """多线程下载所有数据类型的测试数据"""
+        """多线程下载所有数据类型的测试数据 - 每个接口最多一个线程，最多10个线程并发"""
+        logging.info("开始按接口管理的并发测试所有数据字段的下载...")
+
         futures = []
         for data_type in DATA_INTERFACE_CONFIG.keys():
-            # 检查是否是每日请求限制接口（如report_rc）
-            config = DATA_INTERFACE_CONFIG[data_type]
-            daily_limit = config.get('daily_limit', None)
-
-            if daily_limit is not None:
-                # 对于有每日限制的接口，检查是否还有当日请求次数
-                # 但测试时可能需要特殊处理，因为可能已经用完了每日限制
-                remaining = self.daily_limiter.get_remaining_daily_requests(data_type, daily_limit)
-
-                # 为了测试，我们对有每日限制的接口采用特殊处理
-                # 实际上在测试场景中，我们会使用相同的参数，但需要注意可能遇到限制
-                if remaining <= 0:
-                    logging.info(f"测试: {data_type} 已达到每日请求限制，跳过测试")
-                    continue
-
-            # 提交下载任务到线程池
-            future = self.executor.submit(self.download_single_data_type, data_type)
+            # 为每个接口提交任务，确保每个接口最多一个线程在处理
+            future = self.task_manager.submit_interface_task(
+                data_type,
+                self._download_single_data_type_with_rate_limit,
+                data_type
+            )
             futures.append((data_type, future))
 
         # 处理结果并存储
@@ -436,10 +538,12 @@ class OptimizedDataDownloader:
                 logging.error(f"处理 {data_type} 时出错: {str(e)}")
 
     def download_all_data_daily_update(self):
-        """多线程下载所有数据类型的每日更新数据"""
+        """多线程下载所有数据类型的每日更新数据 - 每个接口最多一个线程，最多10个线程并发"""
+        logging.info("开始按接口管理的并发每日数据更新...")
+
         futures = []
         for data_type in DATA_INTERFACE_CONFIG.keys():
-            # 检查是否是每日请求限制接口（如report_rc）
+            # 检查是否是每日请求限制接口
             config = DATA_INTERFACE_CONFIG[data_type]
             daily_limit = config.get('daily_limit', None)
 
@@ -449,24 +553,31 @@ class OptimizedDataDownloader:
                 if remaining <= 0:
                     logging.info(f"{data_type} 已达到每日请求限制，跳过今日更新")
                     continue
-                # 使用分页下载以充分利用当日剩余请求次数
-                future = self.executor.submit(self.download_daily_update_with_pagination, data_type)
+                # 使用分页下载
+                future = self.task_manager.submit_interface_task(
+                    data_type,
+                    self.download_daily_update_with_pagination,
+                    data_type
+                )
             else:
-                # 普通接口按速率限制下载
-                future = self.executor.submit(self.download_daily_update, data_type)
+                # 普通接口
+                future = self.task_manager.submit_interface_task(
+                    data_type,
+                    self.download_daily_update,
+                    data_type
+                )
 
             futures.append((data_type, future))
 
         # 处理结果并存储
         for data_type, future in futures:
             try:
-                result = future.result()  # 等待任务完成
+                result = future.result()
                 if result is not None:
                     if isinstance(result, list):
-                        # 分页下载返回多个数据框，需要合并
+                        # 分页下载返回多个数据框
                         for i, df in enumerate(result):
                             if df is not None and len(df) > 0:
-                                # 为分页数据添加标识
                                 self.process_and_store_data(f"{data_type}_page_{i}", df)
                     else:
                         # 单次下载返回单个数据框
@@ -477,4 +588,4 @@ class OptimizedDataDownloader:
 
     def close(self):
         """关闭线程池"""
-        self.executor.shutdown(wait=True)
+        self.task_manager.executor.shutdown(wait=True)

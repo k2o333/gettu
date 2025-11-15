@@ -275,14 +275,14 @@ class SchedulerRuntime:
     def run_periodic_tasks():
         """运行周期性任务"""
         today = datetime.now()
-        
+
         # 元数据更新：首先运行字典更新
         evolve_global_dictionaries()
         evolve_industry_dictionaries()
         evolve_area_dictionaries()
         update_stock_basic_with_ids()
         logging.info("元数据更新完成")
-        
+
         # 每月初运行的任务
         if today.day == 1:
             # 更新券商荐股数据
@@ -306,6 +306,19 @@ class SchedulerRuntime:
                     update_last_update_date('report_rc', yesterday)
             except Exception as e:
                 logging.warning(f"更新卖方盈利预测数据失败: {str(e)}")
+
+    @staticmethod
+    def run_smart_initial_build(data_types=None, start_date='20050101', end_date=None):
+        """运行智能初始构建（增强版），使用数据扫描和智能决策"""
+        logging.info("开始智能初始构建（增强版）...")
+        try:
+            # 导入增强版构建函数
+            from custom_build import build_with_enhanced_scan
+            build_with_enhanced_scan(data_types, start_date, end_date)
+            logging.info("智能初始构建（增强版）完成")
+        except Exception as e:
+            logging.error(f"智能初始构建（增强版）失败: {str(e)}")
+            raise
 
 
 class BatchStrategy:
