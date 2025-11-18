@@ -3,10 +3,12 @@ import time
 import threading
 from typing import Dict, Any, Optional, Callable
 import logging
+import psutil
 from datetime import datetime, timedelta
 from collections import defaultdict
 from queue import Queue
-from config import DATA_INTERFACE_CONFIG
+from config import DATA_INTERFACE_CONFIG, get_dynamic_streaming_threshold
+from memory_monitor import memory_monitor, memory_safe_operation
 from interface_manager import download_data_by_config
 from etl_runtime import EtlRuntime
 
@@ -151,12 +153,32 @@ class OptimizedDataDownloader:
         self.daily_limiter = DailyLimitManager()
         self.task_manager = InterfaceTaskManager(max_workers=max_workers)
         self.max_workers = max_workers
+        # 初始化内存监控
+        self._check_memory_usage("初始化")
+
+    def _check_memory_usage(self, context: str = ""):
+        """检查当前内存使用情况"""
+        memory_percent = psutil.virtual_memory().percent
+        logging.debug(f"[内存监控] {context} - 当前内存使用率: {memory_percent}%")
+
+        # 如果内存使用率过高，记录警告
+        if memory_percent > 85:
+            logging.warning(f"[内存警告] {context} - 内存使用率过高: {memory_percent}%")
+        elif memory_percent > 95:
+            logging.error(f"[内存严重警告] {context} - 内存使用率严重过高: {memory_percent}%")
+
+        return memory_percent
 
     def download_with_retry(self, data_type: str, params: Dict[str, Any], max_retries: int = 3) -> Any:
         """带重试机制的下载"""
+        # 检查内存使用情况
+        self._check_memory_usage(f"下载 {data_type} 前")
+
         for attempt in range(max_retries):
             try:
                 result = download_data_by_config(data_type, **params)
+                # 下载完成后检查内存使用情况
+                self._check_memory_usage(f"下载 {data_type} 后")
                 return result
             except Exception as e:
                 error_msg = str(e)
@@ -498,6 +520,15 @@ class OptimizedDataDownloader:
         """处理和存储数据"""
         if df is not None and len(df) > 0:
             try:
+                # 检查内存使用情况
+                current_memory = self._check_memory_usage(f"处理 {data_type} 数据前，数据大小: {len(df)} 条")
+
+                # 检查是否需要触发内存压力处理
+                if current_memory > 85:
+                    # 如果内存使用率过高，先稍微等待
+                    logging.warning(f"内存压力过高，等待5秒后再处理 {data_type}")
+                    time.sleep(5)
+
                 # 在独立线程中运行ETL处理
                 # Note: For ETL processing, we may still want to use a separate thread
                 # but we need to ensure we don't cause conflicts with interface processing
@@ -509,8 +540,14 @@ class OptimizedDataDownloader:
     def _run_etl_process(self, data_type: str, df):
         """运行ETL处理"""
         try:
+            # 检查内存使用情况
+            self._check_memory_usage(f"开始ETL处理 {data_type}")
+
             EtlRuntime.process_data(data_type, df=df)
             logging.info(f"{data_type} 数据已存储到指定位置")
+
+            # ETL处理完成后检查内存使用情况
+            self._check_memory_usage(f"完成ETL处理 {data_type}")
         except Exception as e:
             logging.error(f"ETL处理 {data_type} 时出错: {str(e)}")
 

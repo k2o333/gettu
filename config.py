@@ -1439,13 +1439,12 @@ FIELD_MAPPING_CONFIG = {
 # 数据类型配置
 FIELD_TYPE_CONFIG = {
     'date_fields': ['trade_date', 'ann_date', 'end_date', 'report_date'],
-    'id_fields': ['ts_code', 'ts_code_id', 'stock_id'],
+    'id_fields': ['ts_code', 'ts_code_id', 'stock_id', 'industry_id', 'area_id'],
     'numeric_fields': ['open', 'close', 'high', 'low', 'volume', 'amount'],
     'string_fields': ['name', 'industry', 'area']
 }
 
 # API配置
-API_RATE_LIMIT = 400  # 默认API限频（每分钟），设置为400以确保安全
 API_MAX_RETRIES = 3   # API调用最大重试次数
 
 # 并行处理配置（优化：充分利用28核）
@@ -1470,6 +1469,21 @@ def get_dynamic_streaming_threshold():
     if memory_percent > 85:
         # 内存紧张，使用保守阈值
         return 1_000_000
+    elif memory_percent > 75:
+        # 内存较紧张，使用中等阈值
+        return 2_000_000
     else:
         # 内存宽松，使用较大阈值以减少调度开销
         return STREAMING_THRESHOLD
+
+
+def get_memory_usage():
+    """获取当前内存使用率"""
+    import psutil
+    return psutil.virtual_memory().percent
+
+
+def get_memory_available():
+    """获取当前可用内存"""
+    import psutil
+    return psutil.virtual_memory().available

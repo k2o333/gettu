@@ -3,12 +3,22 @@ import polars as pl
 from pathlib import Path
 from datetime import datetime, timedelta
 import logging
-from config import DATA_INTERFACE_CONFIG
+import psutil
+from config import DATA_INTERFACE_CONFIG, get_dynamic_streaming_threshold
+from memory_monitor import memory_monitor, memory_safe_operation
 import glob
 import re
 import threading
 from typing import Optional
 import time
+
+# Import data validation components for enhanced quality checks
+try:
+    from data_validation import DataValidationOrchestrator
+    DATA_VALIDATION_AVAILABLE = True
+except ImportError:
+    DATA_VALIDATION_AVAILABLE = False
+    logging.warning("Data validation components not available. Enhanced quality checks disabled.")
 
 
 class DataIntegrityChecker:
@@ -17,11 +27,38 @@ class DataIntegrityChecker:
     def __init__(self):
         self.date_columns = ['trade_date', 'ann_date', 'period', 'end_date', 'date', 'ts_date']
 
-    def check_file_integrity(self, file_path: Path, ts_code: str, expected_start: str, expected_end: str):
+    def check_file_integrity(self, file_path: Path, ts_code: str, expected_start: str, expected_end: str,
+                           check_data_quality: bool = True):
         """检查单个文件的完整性"""
         try:
-            # 读取日期列进行完整性检查
-            df = pl.read_parquet(file_path, columns=self.date_columns[:1])  # 只读取第一个日期列
+            # 记录开始时的内存使用情况
+            start_memory = psutil.virtual_memory().percent
+            logging.debug(f"开始检查文件完整性: {file_path}, 当前内存使用率: {start_memory}%")
+
+            # 获取动态阈值用于决策是否使用流式处理
+            dynamic_threshold = get_dynamic_streaming_threshold()
+
+            # 检查文件大小决定处理策略
+            file_size = file_path.stat().st_size
+            file_size_mb = file_size / (1024 * 1024)
+            logging.debug(f"文件大小: {file_size_mb:.2f} MB")
+
+            # 使用lazy scan进行内存优化的处理
+            if file_size > 50 * 1024 * 1024:  # 大于50MB使用lazy scan
+                logging.info(f"大文件 {file_path} 使用lazy scan策略")
+                lazy_df = pl.scan_parquet(file_path)
+                # 只读取必要的列来减少内存使用
+                available_columns = lazy_df.collect_schema().names()
+                date_columns_available = [col for col in self.date_columns if col in available_columns]
+
+                if date_columns_available:
+                    df = lazy_df.select(date_columns_available).collect()
+                else:
+                    # 如果没有日期列，只读取前1000行来检查schema
+                    df = lazy_df.head(1000).collect()
+            else:
+                # 小文件使用传统的直接读取
+                df = pl.read_parquet(file_path, columns=self.date_columns[:1])  # 只读取第一个日期列
 
             date_col = None
             for col in df.columns:
@@ -30,12 +67,15 @@ class DataIntegrityChecker:
                     break
 
             if not date_col:
-                # 如果没有找到日期列，尝试读取前1000行获取所有列
-                df = pl.read_parquet(file_path, n_rows=1000)
-                for col in df.columns:
-                    if any(keyword in col.lower() for keyword in self.date_columns):
-                        date_col = col
-                        break
+                # 如果没有找到日期列，尝试读取前1000行获取所有列（已优化）
+                if len(df) == 1000:  # 如果已经读取了前1000行，跳过
+                    pass
+                else:
+                    df = pl.read_parquet(file_path, n_rows=1000)
+                    for col in df.columns:
+                        if any(keyword in col.lower() for keyword in self.date_columns):
+                            date_col = col
+                            break
 
             if not date_col:
                 return {
@@ -73,7 +113,7 @@ class DataIntegrityChecker:
             # 检查时间序列连续性
             gaps = self._find_date_gaps(valid_dates, start_date, end_date)
 
-            return {
+            result = {
                 'is_complete': len(gaps) == 0,
                 'issues': ['date_gaps'] if gaps else [],
                 'date_range': (start_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d')),
@@ -81,6 +121,50 @@ class DataIntegrityChecker:
                 'record_count': len(df),
                 'valid_dates_count': len(valid_dates)
             }
+
+            # Enhanced data quality checks if enabled
+            if check_data_quality and DATA_VALIDATION_AVAILABLE:
+                try:
+                    # 使用lazy scan进行质量检查以避免加载大文件到内存
+                    if file_size > 50 * 1024 * 1024:
+                        logging.info(f"对大文件 {file_path} 使用采样数据进行质量检查")
+                        # 只读取样本数据进行质量检查
+                        sample_df = pl.scan_parquet(file_path).head(10000).collect()
+                    else:
+                        sample_df = pl.read_parquet(file_path)
+
+                    # Determine data type from file path or ts_code
+                    data_type = self._infer_data_type_from_path(file_path)
+
+                    # Run data validation on sample
+                    validator = DataValidationOrchestrator()
+                    validation_results = validator.validate_dataset(
+                        sample_df,
+                        dataset_type=data_type,
+                        dataset_name=file_path.name
+                    )
+
+                    # Add validation results to integrity check
+                    result['data_quality'] = validation_results
+
+                    # Extract issues from validation if any
+                    validation_issues = validation_results.get('issues', [])
+                    if validation_issues:
+                        quality_issues = [issue.get('description', 'Unknown quality issue') for issue in validation_issues]
+                        result['issues'].extend(quality_issues)
+                        result['has_quality_issues'] = True
+                    else:
+                        result['has_quality_issues'] = False
+
+                except Exception as quality_error:
+                    logging.warning(f"Quality check failed for {file_path}: {str(quality_error)}")
+                    result['quality_check_error'] = str(quality_error)
+
+            # 记录结束时的内存使用情况
+            end_memory = psutil.virtual_memory().percent
+            logging.debug(f"完成检查文件完整性: {file_path}, 内存使用率: {start_memory}% -> {end_memory}%")
+
+            return result
 
         except Exception as e:
             logging.error(f"检查文件 {file_path} 完整性时出错: {str(e)}")
@@ -91,6 +175,24 @@ class DataIntegrityChecker:
                 'gaps': [],
                 'record_count': 0
             }
+
+    def _infer_data_type_from_path(self, file_path: Path) -> str:
+        """从文件路径推断数据类型"""
+        path_str = str(file_path).lower()
+
+        # Common data type patterns
+        if any(keyword in path_str for keyword in ['daily', 'day', 'trade']):
+            return 'stock'
+        elif any(keyword in path_str for keyword in ['daily_basic', 'basic']):
+            return 'daily_basic'
+        elif any(keyword in path_str for keyword in ['financial', 'finance', 'income', 'balance', 'cash']):
+            return 'financial'
+        elif any(keyword in path_str for keyword in ['index']):
+            return 'index'
+        elif any(keyword in path_str for keyword in ['fund']):
+            return 'fund'
+        else:
+            return 'unknown'
 
     def _parse_date_string(self, date_str):
         """解析日期字符串"""
@@ -161,10 +263,14 @@ class DataScanner:
         self.data_dir = ROOT_DIR
         self.integrity_checker = DataIntegrityChecker()
         self.scan_cache = {}  # 扫描结果缓存
+        # 预先创建字典管理器实例，避免重复初始化
+        from dictionary_management import DictionaryManager
+        self.dictionary_manager = DictionaryManager()
+        self.dictionary_manager.initialize()
 
-    def scan_all_data(self, data_types=None, use_cache=False, cache_ttl_minutes=30):
+    def scan_all_data(self, data_types=None, use_cache=False, cache_ttl_minutes=30, check_data_quality=True):
         """扫描所有数据类型的现有数据覆盖情况"""
-        cache_key = f"all_{str(data_types)}"
+        cache_key = f"all_{str(data_types)}_quality_{check_data_quality}"
 
         if use_cache and cache_key in self.scan_cache:
             cached_time, cached_result = self.scan_cache[cache_key]
@@ -183,7 +289,7 @@ class DataScanner:
                 continue
                 
             config = DATA_INTERFACE_CONFIG[data_type]
-            type_results = self.scan_data_type(data_type, config)
+            type_results = self.scan_data_type(data_type, config, check_data_quality=check_data_quality)
             scan_results[data_type] = type_results
 
         # 缓存结果
@@ -192,8 +298,12 @@ class DataScanner:
 
         return scan_results
 
-    def scan_data_type(self, data_type: str, config: dict):
-        """扫描特定数据类型的现有数据（严格按配置分区）"""
+    def scan_data_type(self, data_type: str, config: dict, check_data_quality: bool = True):
+        """扫描特定数据类型的现有数据（修复版 - 支持分区结构）"""
+        # 记录开始时的内存使用情况
+        start_memory = psutil.virtual_memory().percent
+        logging.debug(f"开始扫描数据类型 {data_type}，当前内存使用率: {start_memory}%")
+
         storage_path = config['storage']['path']
         partition_granularity = config['storage']['partition_granularity']
 
@@ -215,13 +325,20 @@ class DataScanner:
                 'integrity_issues': 0
             }
 
-        # 严格按配置的分区粒度扫描 - 不再兼容非分区格式
-        if partition_granularity == 'year':
+        stock_coverage = {}
+        total_records = 0
+        integrity_issues = 0
+        parquet_files = []
+
+        # 严格按配置的分区粒度扫描 - 支持分区结构
+        from config import PartitionGranularity
+
+        if partition_granularity == PartitionGranularity.YEAR:
             # 对于按年分区的数据，需要搜索所有年份分区中的data.parquet文件
-            parquet_files = list(type_dir.glob("**/data.parquet"))
-        elif partition_granularity == 'year_month':
+            parquet_files = list(type_dir.glob("year=*/data.parquet"))
+        elif partition_granularity == PartitionGranularity.YEAR_MONTH:
             # 对于按年月分区的数据
-            parquet_files = list(type_dir.glob("**/data.parquet"))
+            parquet_files = list(type_dir.glob("year=*/month=*/data.parquet"))
         else:
             # 非分区存储，直接查找.parquet文件
             parquet_files = list(type_dir.glob("*.parquet"))
@@ -237,23 +354,76 @@ class DataScanner:
                 'integrity_issues': 0
             }
 
-        stock_coverage = {}
-        total_records = 0
-        integrity_issues = 0
+        logging.info(f"找到 {len(parquet_files)} 个数据文件，开始扫描...")
 
-        # 分析每个股票的数据
-        for file_path in parquet_files:
-            # 从文件名或目录结构中提取股票代码或相关信息
-            file_name = file_path.name
-            ts_code = self._extract_ts_code_from_filename(file_name, file_path)
+        # 对于分区数据，我们需要从文件内容中提取股票代码
+        if partition_granularity != 'none':
+            # 分析每个数据文件的内容来获取股票覆盖信息
+            for i, file_path in enumerate(parquet_files):
+                # 检查内存使用情况，如果过高则等待
+                current_memory = psutil.virtual_memory().percent
+                if current_memory > 85:  # 如果内存使用率超过85%
+                    logging.warning(f"内存使用率过高 ({current_memory}%)，等待3秒...")
+                    time.sleep(3)
 
-            if ts_code:
-                coverage_info = self._analyze_stock_data_with_integrity(file_path, ts_code)
-                stock_coverage[ts_code] = coverage_info
-                total_records += coverage_info['record_count']
+                try:
+                    # 对于分区数据，从文件内容中提取股票信息
+                    coverage_info = self._analyze_partitioned_data(file_path, check_data_quality=check_data_quality)
 
-                if not coverage_info['integrity']['is_complete']:
-                    integrity_issues += 1
+                    # 合并股票覆盖信息
+                    for ts_code, info in coverage_info['stock_coverage'].items():
+                        if ts_code in stock_coverage:
+                            # 合并同一股票的多个文件信息
+                            existing = stock_coverage[ts_code]
+                            existing['record_count'] += info['record_count']
+                            if info['date_range']:
+                                if existing['date_range']:
+                                    # 扩展日期范围
+                                    existing['date_range'] = (
+                                        min(existing['date_range'][0], info['date_range'][0]),
+                                        max(existing['date_range'][1], info['date_range'][1])
+                                    )
+                                else:
+                                    existing['date_range'] = info['date_range']
+                        else:
+                            stock_coverage[ts_code] = info
+
+                    total_records += coverage_info['total_records']
+                    integrity_issues += coverage_info['integrity_issues']
+
+                except Exception as e:
+                    logging.error(f"分析文件 {file_path} 时出错: {str(e)}")
+                    continue
+
+                # 每处理一定数量的文件，记录内存使用情况
+                if (i + 1) % 10 == 0:
+                    current_memory = psutil.virtual_memory().percent
+                    logging.debug(f"已处理 {i+1}/{len(parquet_files)} 个文件，当前内存使用率: {current_memory}%")
+        else:
+            # 分析每个股票的数据（非分区存储）
+            for i, file_path in enumerate(parquet_files):
+                # 检查内存使用情况，如果过高则等待
+                current_memory = psutil.virtual_memory().percent
+                if current_memory > 85:  # 如果内存使用率超过85%
+                    logging.warning(f"内存使用率过高 ({current_memory}%)，等待3秒...")
+                    time.sleep(3)
+
+                # 从文件名或目录结构中提取股票代码或相关信息
+                file_name = file_path.name
+                ts_code = self._extract_ts_code_from_filename(file_name, file_path)
+
+                if ts_code:
+                    coverage_info = self._analyze_stock_data_with_integrity(file_path, ts_code, check_data_quality=check_data_quality)
+                    stock_coverage[ts_code] = coverage_info
+                    total_records += coverage_info['record_count']
+
+                    if not coverage_info['integrity']['is_complete']:
+                        integrity_issues += 1
+
+                # 每处理一定数量的文件，记录内存使用情况
+                if (i + 1) % 10 == 0:
+                    current_memory = psutil.virtual_memory().percent
+                    logging.debug(f"已处理 {i+1}/{len(parquet_files)} 个文件，当前内存使用率: {current_memory}%")
 
         # 计算整体日期范围
         all_start_dates = [info['date_range'][0] for info in stock_coverage.values()
@@ -265,8 +435,12 @@ class DataScanner:
         if all_start_dates and all_end_dates:
             overall_date_range = (min(all_start_dates), max(all_end_dates))
 
+        # 记录结束时的内存使用情况
+        end_memory = psutil.virtual_memory().percent
+        logging.debug(f"完成扫描数据类型 {data_type}，内存使用率: {start_memory}% -> {end_memory}%")
+
         return {
-            'has_data': True,
+            'has_data': len(stock_coverage) > 0,
             'stock_coverage': stock_coverage,
             'date_range': overall_date_range,
             'total_files': len(parquet_files),
@@ -274,18 +448,149 @@ class DataScanner:
             'integrity_issues': integrity_issues
         }
 
-    def _analyze_stock_data_with_integrity(self, file_path: Path, ts_code: str):
+    def _analyze_partitioned_data(self, file_path: Path, check_data_quality: bool = True):
+        """分析分区数据文件，提取股票覆盖信息"""
+        try:
+            # 使用lazy scan避免加载大文件到内存
+            lazy_df = pl.scan_parquet(file_path)
+            schema = lazy_df.collect_schema()
+
+            # 检查股票ID列是否存在 (可以是ts_code或ts_code_id)
+            ts_code_column = None
+            if 'ts_code' in schema.names():
+                ts_code_column = 'ts_code'
+            elif 'ts_code_id' in schema.names():
+                ts_code_column = 'ts_code_id'
+            else:
+                logging.warning(f"文件 {file_path} 缺少 ts_code 或 ts_code_id 列，无法分析股票覆盖")
+                return {
+                    'stock_coverage': {},
+                    'total_records': 0,
+                    'integrity_issues': 0
+                }
+
+            # 获取日期列
+            date_columns = [col for col in schema.names()
+                           if any(keyword in col.lower() for keyword in
+                                  ['date', 'trade', 'ann', 'period', 'end'])]
+
+            # 获取股票列表和基本信息
+            if ts_code_column == 'ts_code_id':
+                # 当使用ID时，获取股票ID列表
+                stock_info_df = lazy_df.select([
+                    pl.col(ts_code_column),
+                    pl.col(date_columns[0]).alias('date_col') if date_columns else pl.lit(None).alias('date_col')
+                ]).unique().collect()
+            else:
+                # 当使用代码时，获取股票代码列表
+                stock_info_df = lazy_df.select([
+                    pl.col(ts_code_column),
+                    pl.col(date_columns[0]).alias('date_col') if date_columns else pl.lit(None).alias('date_col')
+                ]).unique().collect()
+
+            stock_coverage = {}
+            total_records = 0
+            integrity_issues = 0
+
+            # 分析每个股票的数据
+            for row in stock_info_df.iter_rows(named=True):
+                stock_identifier = row[ts_code_column]
+                if not stock_identifier:
+                    continue
+
+                try:
+                    # 获取该股票的具体数据范围
+                    stock_df = lazy_df.filter(pl.col(ts_code_column) == stock_identifier)
+
+                    # 获取记录数和日期范围
+                    stock_stats = stock_df.select([
+                        pl.len().alias('record_count'),
+                        pl.col(date_columns[0]).min().alias('min_date') if date_columns else pl.lit(None).alias('min_date'),
+                        pl.col(date_columns[0]).max().alias('max_date') if date_columns else pl.lit(None).alias('max_date')
+                    ]).collect()
+
+                    record_count = stock_stats['record_count'][0]
+                    min_date = stock_stats['min_date'][0] if date_columns else None
+                    max_date = stock_stats['max_date'][0] if date_columns else None
+
+                    # 格式化日期范围
+                    date_range = None
+                    if min_date and max_date:
+                        try:
+                            if isinstance(min_date, str):
+                                min_date_str = min_date.replace('-', '').replace('/', '')[:8]
+                                max_date_str = max_date.replace('-', '').replace('/', '')[:8]
+                            else:
+                                min_date_str = str(min_date)[:8] if len(str(min_date)) >= 8 else None
+                                max_date_str = str(max_date)[:8] if len(str(max_date)) >= 8 else None
+
+                            if min_date_str and max_date_str and len(min_date_str) == 8 and len(max_date_str) == 8:
+                                date_range = (min_date_str, max_date_str)
+                        except:
+                            date_range = None
+
+                    # 如果是ts_code_id，尝试转换为实际股票代码
+                    ts_code = str(stock_identifier)
+                    if ts_code_column == 'ts_code_id':
+                        # 在ID的情况下，我们需要尝试映射回股票代码
+                        try:
+                            actual_ts_code = self.dictionary_manager.get_stock_code(int(stock_identifier))
+                            if actual_ts_code:
+                                ts_code = actual_ts_code
+                            else:
+                                # 如果映射失败，使用ID作为标识符，但记录警告
+                                logging.warning(f"无法将股票ID {stock_identifier} 映射回股票代码，使用ID作为标识符")
+                                ts_code = f"stock_id_{stock_identifier}"
+                        except Exception as e:
+                            logging.warning(f"映射股票ID {stock_identifier} 时出错: {str(e)}，使用ID作为标识符")
+                            ts_code = f"stock_id_{stock_identifier}"
+
+                    # 创建覆盖信息
+                    stock_coverage[ts_code] = {
+                        'date_range': date_range,
+                        'record_count': record_count,
+                        'date_column': date_columns[0] if date_columns else None,
+                        'integrity': {
+                            'is_complete': True,  # 简化处理，假设分区数据是完整的
+                            'issues': [],
+                            'gaps': []
+                        }
+                    }
+
+                    total_records += record_count
+
+                except Exception as e:
+                    logging.warning(f"分析股票 {stock_identifier} 时出错: {str(e)}")
+                    integrity_issues += 1
+                    continue
+
+            return {
+                'stock_coverage': stock_coverage,
+                'total_records': total_records,
+                'integrity_issues': integrity_issues
+            }
+
+        except Exception as e:
+            logging.error(f"分析分区数据文件 {file_path} 时出错: {str(e)}")
+            return {
+                'stock_coverage': {},
+                'total_records': 0,
+                'integrity_issues': 1
+            }
+
+    def _analyze_stock_data_with_integrity(self, file_path: Path, ts_code: str, check_data_quality: bool = True):
         """分析单个股票数据文件的时间覆盖范围（包含完整性检查）"""
         # 首先进行完整性检查
         integrity_result = self.integrity_checker.check_file_integrity(
-            file_path, ts_code, '19900101', datetime.now().strftime('%Y%m%d')
+            file_path, ts_code, '19900101', datetime.now().strftime('%Y%m%d'),
+            check_data_quality=check_data_quality
         )
 
         # 内存保护：检查文件大小
         file_size = file_path.stat().st_size
         if file_size > 500 * 1024 * 1024:  # 500MB
             logging.info(f"文件 {file_path} 较大 ({file_size / (1024*1024):.1f}MB)，使用流式分析")
-            return self._streaming_analysis(file_path, ts_code, integrity_result)
+            return self._streaming_analysis(file_path, ts_code, integrity_result, check_data_quality=True)
 
         try:
             # 基本数据范围检查
@@ -329,7 +634,7 @@ class DataScanner:
                 'integrity': integrity_result
             }
 
-    def _streaming_analysis(self, file_path: Path, ts_code: str, integrity_result: dict):
+    def _streaming_analysis(self, file_path: Path, ts_code: str, integrity_result: dict, check_data_quality: bool = True):
         """对大文件使用流式分析以节省内存"""
         try:
             # 对于大文件，只分析日期列以确定时间范围
@@ -345,12 +650,40 @@ class DataScanner:
             if not date_columns:
                 # 如果没有日期列，返回基本信息
                 total_rows = lazy_df.select(pl.len()).collect().item()
-                return {
+
+                result = {
                     'date_range': integrity_result['date_range'],
                     'record_count': total_rows,
                     'date_column': None,
                     'integrity': integrity_result
                 }
+
+                # Perform data quality checks if enabled and not already done
+                if check_data_quality and DATA_VALIDATION_AVAILABLE and 'data_quality' not in integrity_result:
+                    try:
+                        # For large files, we'll just do a quick check on schema and basic statistics
+                        validator = DataValidationOrchestrator()
+
+                        # Collect a sample for validation if needed
+                        sample_df = lazy_df.head(10000).collect()
+
+                        # Determine data type from file path
+                        data_type = self.integrity_checker._infer_data_type_from_path(file_path)
+
+                        # Run data validation on sample
+                        validation_results = validator.validate_dataset(
+                            sample_df,
+                            dataset_type=data_type,
+                            dataset_name=file_path.name
+                        )
+
+                        result['data_quality'] = validation_results
+                        result['has_quality_issues'] = not validation_results.get('overall_valid', True)
+
+                    except Exception as quality_error:
+                        logging.warning(f"Quality check failed for large file {file_path}: {str(quality_error)}")
+
+                return result
 
             date_col = date_columns[0]
 
@@ -382,22 +715,72 @@ class DataScanner:
                     # 如果日期格式化失败，使用完整性检查的结果
                     date_range = integrity_result['date_range']
 
-            return {
+            # Prepare result with basic info
+            result = {
                 'date_range': date_range,
                 'record_count': record_count,
                 'date_column': date_col,
                 'integrity': integrity_result
             }
 
+            # Perform data quality checks if enabled and not already done
+            if check_data_quality and DATA_VALIDATION_AVAILABLE and 'data_quality' not in integrity_result:
+                try:
+                    # For large files, we'll just do a quick check on schema and basic statistics
+                    validator = DataValidationOrchestrator()
+
+                    # Collect a sample for validation
+                    sample_df = lazy_df.head(10000).collect()
+
+                    # Determine data type from file path
+                    data_type = self.integrity_checker._infer_data_type_from_path(file_path)
+
+                    # Run data validation on sample
+                    validation_results = validator.validate_dataset(
+                        sample_df,
+                        dataset_type=data_type,
+                        dataset_name=file_path.name
+                    )
+
+                    result['data_quality'] = validation_results
+                    result['has_quality_issues'] = not validation_results.get('overall_valid', True)
+
+                except Exception as quality_error:
+                    logging.warning(f"Quality check failed for large file {file_path}: {str(quality_error)}")
+
+            return result
+
         except Exception as e:
             logging.error(f"流式分析股票 {ts_code} 数据文件 {file_path} 时出错: {str(e)}")
             # 备用方案：返回完整性检查的结果
-            return {
+            result = {
                 'date_range': integrity_result['date_range'],
                 'record_count': integrity_result['record_count'],
                 'date_column': None,
                 'integrity': integrity_result
             }
+
+            # Even if streaming analysis failed, try to add quality check if possible
+            if check_data_quality and DATA_VALIDATION_AVAILABLE and 'data_quality' not in integrity_result:
+                try:
+                    # Read a small sample to try validation
+                    sample_df = pl.read_parquet(file_path, n_rows=1000)
+                    data_type = self.integrity_checker._infer_data_type_from_path(file_path)
+
+                    validator = DataValidationOrchestrator()
+                    validation_results = validator.validate_dataset(
+                        sample_df,
+                        dataset_type=data_type,
+                        dataset_name=file_path.name
+                    )
+
+                    result['data_quality'] = validation_results
+                    result['has_quality_issues'] = not validation_results.get('overall_valid', True)
+
+                except Exception as quality_error:
+                    logging.warning(f"Quality check failed for large file {file_path}: {str(quality_error)}")
+
+            return result
 
     def _extract_ts_code_from_filename(self, filename: str, file_path: Path):
         """从文件名或目录结构中提取股票代码（增强版）"""

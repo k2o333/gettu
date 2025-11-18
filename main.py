@@ -53,20 +53,20 @@ def setup_logging():
         raise
 
 
-def initialize_system():
-    """初始化系统"""
+def initialize_system(force_recreate=False):
+    """初始化系统 - 优化版本"""
     logging.info("开始系统初始化...")
-    
+
     # 确保数据目录存在
     from config import ROOT_DIR
     ROOT_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # 初始化元数据数据库
     init_metadata_db()
-    
-    # 创建字典
-    create_dictionaries()
-    
+
+    # 创建字典（仅在需要时重新创建）
+    create_dictionaries(force_recreate=force_recreate)
+
     logging.info("系统初始化完成")
 
 

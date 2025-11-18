@@ -6,6 +6,7 @@ from config import DICT_DIR, SNAPSHOTS_DIR
 from interface_manager import download_data_by_config
 from etl_runtime import EtlRuntime
 import os
+from dictionary_management import DictionaryManager
 
 def evolve_global_dictionaries():
     """
@@ -13,36 +14,60 @@ def evolve_global_dictionaries():
     """
     try:
         logging.info("开始演进全局字典...")
-        
+
+        # Initialize dictionary manager
+        dict_manager = DictionaryManager()
+        dict_manager.initialize()
+
         # 1. 下载并更新股票基本信息
         stock_basic_df = download_data_by_config('stock_basic')
         if stock_basic_df is not None and len(stock_basic_df) > 0:
-            # 创建ID映射列
+            # Add stocks to dictionary management system with permanent IDs
+            for row in stock_basic_df.iter_rows(named=True):
+                ts_code = row['ts_code']
+                # Add stock to dictionary with metadata
+                stock_id = dict_manager.add_stock(ts_code, {
+                    'name': row.get('name', ''),
+                    'area': row.get('area', ''),
+                    'industry': row.get('industry', ''),
+                    'market': row.get('market', ''),
+                    'list_date': row.get('list_date', '')
+                })
+
+            # Create ID mapping column using permanent IDs
+            ts_code_to_id = {}
+            for row in stock_basic_df.iter_rows(named=True):
+                ts_code = row['ts_code']
+                ts_code_to_id[ts_code] = dict_manager.get_stock_id(ts_code)
+
             stock_basic_df = stock_basic_df.with_columns([
                 pl.col('ts_code').cast(pl.Categorical).alias('ts_code_cat'),
-                # 生成数值ID (这里使用哈希值作为ID)
-                (pl.col('ts_code').hash() % 100000000).alias('ts_code_id')
+                # Use permanent IDs from dictionary management system
+                pl.col('ts_code').map_elements(
+                    lambda x: ts_code_to_id.get(x, None),
+                    return_dtype=pl.Int64
+                ).alias('ts_code_id')
             ])
-            
+
             # 确保字典目录存在
             DICT_DIR.mkdir(parents=True, exist_ok=True)
-            
+
             # 保存股票基础信息
             dict_path = DICT_DIR / 'stock_basic_dict.parquet'
             stock_basic_df.write_parquet(dict_path)
             logging.info(f"股票基础字典更新完成: {len(stock_basic_df)} 条记录")
-        
+
         # 2. 下载并更新交易日历
         trade_cal_df = download_data_by_config('trade_cal')
         if trade_cal_df is not None and len(trade_cal_df) > 0:
             # 确保交易日历目录存在
             DICT_DIR.mkdir(parents=True, exist_ok=True)
-            
+
             # 保存交易日历
             cal_path = DICT_DIR / 'trade_calendar.parquet'
             trade_cal_df.write_parquet(cal_path)
             logging.info(f"交易日历字典更新完成: {len(trade_cal_df)} 条记录")
-            
+
     except Exception as e:
         logging.error(f"演进全局字典失败: {str(e)}")
         raise
@@ -54,38 +79,57 @@ def evolve_industry_dictionaries():
     """
     try:
         logging.info("开始演进行业字典...")
-        
+
+        # Initialize dictionary manager
+        dict_manager = DictionaryManager()
+        dict_manager.initialize()
+
         # 从股票基础信息中提取行业信息
         stock_basic_path = DICT_DIR / 'stock_basic_dict.parquet'
         if stock_basic_path.exists():
             stock_basic_df = pl.read_parquet(stock_basic_path)
-            
+
             # 提取行业列表
             industry_df = (stock_basic_df
                           .select(['industry'])
                           .unique()
-                          .with_row_index('industry_id', offset=1)
-                          .with_columns([
-                              pl.col('industry').cast(pl.Categorical).alias('industry_cat')
-                          ]))
-            
+                          .filter(pl.col('industry').is_not_null()))
+
+            # Add industries to dictionary management system with permanent IDs
+            industry_to_id = {}
+            for row in industry_df.iter_rows(named=True):
+                industry_code = row['industry']
+                if industry_code:
+                    # Add industry to dictionary with permanent ID
+                    industry_id = dict_manager.add_industry(industry_code)
+                    industry_to_id[industry_code] = industry_id
+
+            # Create industry dictionary with permanent IDs
+            industry_dict_df = pl.DataFrame({
+                'industry': list(industry_to_id.keys()),
+                'industry_id': list(industry_to_id.values())
+            }).with_columns([
+                pl.col('industry').cast(pl.Categorical).alias('industry_cat')
+            ])
+
             # 保存行业字典
             industry_path = DICT_DIR / 'industry_dict.parquet'
-            industry_df.write_parquet(industry_path)
-            logging.info(f"行业字典更新完成: {len(industry_df)} 个行业")
-            
-            # 创建股票-行业映射
-            stock_industry_df = stock_basic_df.join(
-                industry_df.select(['industry', 'industry_id']),
-                on='industry',
-                how='left'
-            )
-            
+            industry_dict_df.write_parquet(industry_path)
+            logging.info(f"行业字典更新完成: {len(industry_dict_df)} 个行业")
+
+            # 创建股票-行业映射 using permanent IDs
+            stock_industry_df = stock_basic_df.with_columns([
+                pl.col('industry').map_elements(
+                    lambda x: industry_to_id.get(x, None) if x else None,
+                    return_dtype=pl.Int64
+                ).alias('industry_id')
+            ])
+
             # 保存增强的股票基础信息（包含行业ID）
             enhanced_path = DICT_DIR / 'stock_basic_enhanced.parquet'
             stock_industry_df.write_parquet(enhanced_path)
             logging.info(f"增强股票基础信息保存完成: {len(stock_industry_df)} 条记录")
-        
+
     except Exception as e:
         logging.error(f"演进行业字典失败: {str(e)}")
         raise
@@ -97,26 +141,44 @@ def evolve_area_dictionaries():
     """
     try:
         logging.info("开始演进地区字典...")
-        
+
+        # Initialize dictionary manager
+        dict_manager = DictionaryManager()
+        dict_manager.initialize()
+
         # 从股票基础信息中提取地区信息
         stock_basic_path = DICT_DIR / 'stock_basic_dict.parquet'
         if stock_basic_path.exists():
             stock_basic_df = pl.read_parquet(stock_basic_path)
-            
+
             # 提取地区列表
             area_df = (stock_basic_df
                       .select(['area'])
                       .unique()
-                      .with_row_index('area_id', offset=1)
-                      .with_columns([
-                          pl.col('area').cast(pl.Categorical).alias('area_cat')
-                      ]))
-            
+                      .filter(pl.col('area').is_not_null()))
+
+            # Add regions to dictionary management system with permanent IDs
+            area_to_id = {}
+            for row in area_df.iter_rows(named=True):
+                area_code = row['area']
+                if area_code:
+                    # Add region to dictionary with permanent ID
+                    area_id = dict_manager.add_region(area_code)
+                    area_to_id[area_code] = area_id
+
+            # Create area dictionary with permanent IDs
+            area_dict_df = pl.DataFrame({
+                'area': list(area_to_id.keys()),
+                'area_id': list(area_to_id.values())
+            }).with_columns([
+                pl.col('area').cast(pl.Categorical).alias('area_cat')
+            ])
+
             # 保存地区字典
             area_path = DICT_DIR / 'area_dict.parquet'
-            area_df.write_parquet(area_path)
-            logging.info(f"地区字典更新完成: {len(area_df)} 个地区")
-            
+            area_dict_df.write_parquet(area_path)
+            logging.info(f"地区字典更新完成: {len(area_dict_df)} 个地区")
+
     except Exception as e:
         logging.error(f"演进地区字典失败: {str(e)}")
         raise
@@ -236,31 +298,47 @@ def get_ts_code_dict_path():
     return dict_path
 
 
-def create_dictionaries():
+def dictionaries_exist():
+    """检查字典文件是否已存在"""
+    required_files = [
+        DICT_DIR / 'stock_basic_dict.parquet',
+        DICT_DIR / 'industry_dict.parquet',
+        DICT_DIR / 'area_dict.parquet'
+    ]
+
+    return all(file_path.exists() for file_path in required_files)
+
+
+def create_dictionaries(force_recreate=False):
     """
-    创建所有字典的主函数
+    创建所有字典的主函数 - 修复版本
     """
     try:
         logging.info("开始创建字典...")
-        
+
         # 创建字典目录
         DICT_DIR.mkdir(parents=True, exist_ok=True)
         SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        
+
+        # 检查字典是否已存在
+        if not force_recreate and dictionaries_exist():
+            logging.info("字典已存在，跳过创建步骤")
+            return
+
         # 演进全局字典
         evolve_global_dictionaries()
-        
+
         # 演进行业字典
         evolve_industry_dictionaries()
-        
+
         # 演进地区字典
         evolve_area_dictionaries()
-        
+
         # 更新股票基本信息ID
         update_stock_basic_with_ids()
-        
+
         logging.info("字典创建完成")
-        
+
     except Exception as e:
         logging.error(f"创建字典失败: {str(e)}")
         raise
